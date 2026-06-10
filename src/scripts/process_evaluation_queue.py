@@ -1,6 +1,8 @@
 """Pick up open model-evaluation-request issues and run EuroEval on them.
 
-This script is meant to run on the compute server. For each open
+This script can run on a compute server directly, or on a login node with the
+``--airgapped-slurm`` flag to submit evaluation jobs to airgapped compute nodes.
+For each open
 ``model evaluation request`` issue that is **not yet assigned** to anyone, it:
 
 1. Verifies that the requested model exists on the Hugging Face Hub.
@@ -112,6 +114,12 @@ from leaderboards.queue_runtime import (
     cool_down_between_issues,
     lower_process_priority,
 )
+from leaderboards.queue_slurm import (
+    collect_slurm_results,
+    download_for_airgapped_eval,
+    submit_slurm_eval_job,
+    wait_for_slurm_job,
+)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
@@ -147,6 +155,7 @@ QUEUE_PASS_SLEEP_SECONDS = 60 * 60
 # euroeval CLI default" for the memory utilization knob.
 GPU_MEMORY_UTILIZATION: float | None = None
 THERMAL_CONFIG: ThermalConfig = ThermalConfig()
+AIRGAPPED_SLURM: bool = False
 
 
 def _model_id_to_filename(model_id: str) -> str:
@@ -234,6 +243,7 @@ def parse_args() -> None:
     """Parse CLI arguments and populate the module-level runtime overrides."""
     global GPU_MEMORY_UTILIZATION
     global THERMAL_CONFIG
+    global AIRGAPPED_SLURM
     parser = argparse.ArgumentParser(
         description="Pick up and evaluate open model-evaluation-request issues."
     )
@@ -264,6 +274,16 @@ def parse_args() -> None:
         default=THERMAL_CONFIG.resume_temp_c,
         help="GPU temperature (°C) the GPU must cool to before resuming.",
     )
+    parser.add_argument(
+        "--airgapped-slurm",
+        action="store_true",
+        default=False,
+        help=(
+            "Run in airgapped Slurm mode: download models/datasets on the login "
+            "node with --download-only, then submit Slurm jobs to airgapped compute "
+            "nodes. All GitHub interactions happen on the login node."
+        ),
+    )
     args = parser.parse_args()
     GPU_MEMORY_UTILIZATION = args.gpu_memory_utilization
     THERMAL_CONFIG = ThermalConfig(
@@ -271,6 +291,7 @@ def parse_args() -> None:
         pause_temp_c=args.thermal_pause_temp,
         resume_temp_c=args.thermal_resume_temp,
     )
+    AIRGAPPED_SLURM = args.airgapped_slurm
 
 
 def ensure_credentials() -> None:
@@ -793,38 +814,93 @@ def _run_claimed_issue(
     failure_output_tail = ""
 
     if pending:
-        # Start background thread to upload results incrementally.
-        stop_upload = threading.Event()
-        upload_thread = threading.Thread(
-            target=_upload_results_incrementally,
-            kwargs={
-                "uploader": uploader,
-                "stop_event": stop_upload,
-                "results_path": RESULTS_PATH,
-                "issue_number": number,
-                "issue_body": issue_body,
-                "model_id": model_id,
-            },
-            daemon=True,
-        )
-        upload_thread.start()
+        if AIRGAPPED_SLURM:
+            # Airgapped Slurm mode: pre-download on login node, then submit job.
+            logger.info(
+                f"#{number}: airgapped Slurm mode - pre-downloading for {model_id!r}"
+            )
 
-        before = set(read_jsonl_lines(path=RESULTS_PATH))
-        returncode, output = run_euroeval(
-            model_id=model_id,
-            languages=pending,
-            evaluate_test_split=is_core,
-            clear_model_cache=True,
-            gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
-        )
+            # Step 1: Pre-download models/datasets to shared cache.
+            returncode, output = download_for_airgapped_eval(
+                model_id=model_id, languages=pending, cache_dir=RESULTS_CACHE_DIR.parent
+            )
 
-        # Stop the background uploader and let it finish.
-        stop_upload.set()
-        upload_thread.join(timeout=5)
+            if returncode != 0:
+                failure_reason = f"download-only failed with code {returncode}"
+                failure_output_tail = output[-6000:].strip() or "(no output captured)"
+                failed = pending
+            else:
+                # Step 2: Record which lines existed before Slurm job.
+                before = set(read_jsonl_lines(path=RESULTS_PATH))
 
-        after = read_jsonl_lines(path=RESULTS_PATH)
-        new_lines = [line for line in after if line not in before]
-        accumulated.extend(new_lines)
+                # Step 3: Submit Slurm job to airgapped compute node.
+                job_id = submit_slurm_eval_job(
+                    model_id=model_id,
+                    languages=pending,
+                    cache_dir=RESULTS_CACHE_DIR.parent,
+                    results_path=RESULTS_PATH,
+                    gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+                )
+                logger.info(f"#{number}: submitted Slurm job {job_id} for {model_id!r}")
+
+                # Step 4: Wait for job completion.
+                slurm_exit_code = wait_for_slurm_job(job_id=job_id)
+                logger.info(
+                    f"#{number}: Slurm job {job_id} completed with exit code "
+                    f"{slurm_exit_code}"
+                )
+
+                # Step 5: Collect results.
+                if slurm_exit_code == 0:
+                    new_lines = collect_slurm_results(
+                        results_path=RESULTS_PATH, before_lines=before
+                    )
+                    accumulated.extend(new_lines)
+                    returncode = 0
+                    output = ""
+                else:
+                    failure_reason = (
+                        f"Slurm job {job_id} exited with code {slurm_exit_code}"
+                    )
+                    failure_output_tail = (
+                        "Slurm job failed. Check Slurm logs for details."
+                    )
+                    failed = pending
+                    returncode = slurm_exit_code
+                    output = failure_output_tail
+        else:
+            # Local evaluation mode: run euroeval directly with incremental uploads.
+            stop_upload = threading.Event()
+            upload_thread = threading.Thread(
+                target=_upload_results_incrementally,
+                kwargs={
+                    "uploader": uploader,
+                    "stop_event": stop_upload,
+                    "results_path": RESULTS_PATH,
+                    "issue_number": number,
+                    "issue_body": issue_body,
+                    "model_id": model_id,
+                },
+                daemon=True,
+            )
+            upload_thread.start()
+
+            before = set(read_jsonl_lines(path=RESULTS_PATH))
+            returncode, output = run_euroeval(
+                model_id=model_id,
+                languages=pending,
+                evaluate_test_split=is_core,
+                clear_model_cache=True,
+                gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+            )
+
+            # Stop the background uploader and let it finish.
+            stop_upload.set()
+            upload_thread.join(timeout=5)
+
+            after = read_jsonl_lines(path=RESULTS_PATH)
+            new_lines = [line for line in after if line not in before]
+            accumulated.extend(new_lines)
 
         if GATED_OUTPUT_RE.search(output):
             gated_detected = True
