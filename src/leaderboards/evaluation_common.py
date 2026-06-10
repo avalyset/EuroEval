@@ -96,6 +96,9 @@ def run_euroeval(
     trust_remote_code: bool = True,
     clear_model_cache: bool = True,
     gpu_memory_utilization: float | None = None,
+    download_only: bool = False,
+    cache_dir: Path | None = None,
+    output_file: Path | None = None,
 ) -> tuple[int, str]:
     """Run the euroeval CLI for the given model, languages, and datasets.
 
@@ -125,12 +128,26 @@ def run_euroeval(
             When set, pass ``--gpu-memory-utilization VALUE``. When None,
             omit the flag so the euroeval CLI's default applies. Defaults
             to None.
+        download_only (optional):
+            When True pass ``--download-only`` to only download models
+            and datasets without running evaluation. Defaults to False.
+        cache_dir (optional):
+            When set, pass ``--cache-dir PATH``. When None, the euroeval
+            CLI default applies. Defaults to None.
+        output_file (optional):
+            When set, pass ``--output-file PATH`` to write results to a
+            specific file. When None, the euroeval CLI default applies.
+            Defaults to None.
 
     Returns:
         A ``(returncode, combined_output)`` pair. A returncode of 127
         signals that the CLI was not found on PATH.
     """
     cmd: list[str] = ["euroeval", "--model", model_id]
+    if download_only:
+        cmd.append("--download-only")
+    if cache_dir is not None:
+        cmd += ["--cache-dir", str(cache_dir)]
     if clear_model_cache:
         cmd.append("--clear-model-cache")
     if trust_remote_code:
@@ -146,6 +163,8 @@ def run_euroeval(
         cmd += ["--dataset", dataset]
     if gpu_memory_utilization is not None:
         cmd += ["--gpu-memory-utilization", str(gpu_memory_utilization)]
+    if output_file is not None:
+        cmd += ["--output-file", str(output_file)]
     logger.info(f"Running: {' '.join(cmd)}")
 
     env = os.environ.copy()

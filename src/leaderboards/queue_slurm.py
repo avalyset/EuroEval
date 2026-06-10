@@ -16,6 +16,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from leaderboards.evaluation_common import run_euroeval
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,8 +33,8 @@ def download_for_airgapped_eval(
     """Download models and datasets for airgapped evaluation.
 
     Runs ``euroeval --download-only`` on the login node to pre-download
-    models and datasets into a shared cache directory. Uses the same
-    command construction as ``run_euroeval()`` in ``evaluation_common.py``.
+    models and datasets into a shared cache directory. Delegates to
+    ``run_euroeval()`` with the ``download_only`` flag.
 
     Args:
         model_id:
@@ -60,45 +62,18 @@ def download_for_airgapped_eval(
         A ``(returncode, output)`` tuple. A returncode of 127 signals
         that the CLI was not found on PATH.
     """
-    cmd: list[str] = [
-        "euroeval",
-        "--model",
-        model_id,
-        "--download-only",
-        "--cache-dir",
-        str(cache_dir),
-        "--trust-remote-code",
-    ]
-    cmd.append(
-        "--evaluate-test-split" if evaluate_test_split else "--evaluate-val-split"
+    return run_euroeval(
+        model_id=model_id,
+        languages=languages,
+        datasets=datasets,
+        evaluate_test_split=evaluate_test_split,
+        zero_shot=zero_shot,
+        trust_remote_code=True,
+        clear_model_cache=False,  # Don't clear cache for download
+        gpu_memory_utilization=gpu_memory_utilization,
+        download_only=True,
+        cache_dir=cache_dir,
     )
-    if zero_shot:
-        cmd.append("--zero-shot")
-    for lang in languages:
-        cmd += ["--language", lang]
-    for dataset in datasets or []:
-        cmd += ["--dataset", dataset]
-    if gpu_memory_utilization is not None:
-        cmd += ["--gpu-memory-utilization", str(gpu_memory_utilization)]
-
-    logger.info(f"Downloading for airgapped eval: {' '.join(cmd)}")
-
-    env = os.environ.copy()
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_API_KEY")
-    if token:
-        env.setdefault("HF_TOKEN", token)
-        env.setdefault("HUGGINGFACE_API_KEY", token)
-
-    try:
-        proc = subprocess.Popen(  # noqa: S603
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, text=True
-        )
-    except FileNotFoundError:
-        logger.error("`euroeval` CLI not found on PATH. Is it installed?")
-        return 127, "`euroeval` CLI not found on PATH."
-
-    stdout, _ = proc.communicate()
-    return proc.returncode, stdout or ""
 
 
 def submit_slurm_eval_job(
@@ -107,7 +82,7 @@ def submit_slurm_eval_job(
     cache_dir: Path,
     results_path: Path,
     gpu_memory_utilization: float | None = None,
-) -> str:
+) -> tuple[str, Path]:
     """Submit a Slurm job for running EuroEval evaluation.
 
     Creates a temporary Slurm script that runs the evaluation with the
@@ -121,13 +96,15 @@ def submit_slurm_eval_job(
         cache_dir:
             Path to the pre-populated model/dataset cache.
         results_path:
-            Path to the shared results JSONL file.
+            Path to the shared results JSONL file. The job will write to
+            a job-specific file adjacent to this path.
         gpu_memory_utilization (optional):
             GPU memory utilisation fraction (0.0–1.0). When None, the
             euroeval CLI default applies. Defaults to None.
 
     Returns:
-        The Slurm job ID as a string.
+        A ``(job_id, job_results_path)`` tuple. The job results path points
+        to a job-specific JSONL file that the compute node will write to.
 
     Raises:
         RuntimeError:
@@ -149,8 +126,12 @@ def submit_slurm_eval_job(
     if gpu_memory_utilization is not None:
         cmd_parts += ["--gpu-memory-utilization", str(gpu_memory_utilization)]
 
-    # Add results output redirection
-    cmd_parts += ["--output-file", str(results_path)]
+    # Use a job-specific results file to avoid race conditions
+    # The file will be alongside the main results file
+    job_id_for_filename = "$(SLURM_JOB_ID)"
+    job_results_filename = f".euroeval_job_{job_id_for_filename}.jsonl"
+    job_results_path = results_path.parent / job_results_filename
+    cmd_parts += ["--output-file", str(job_results_path)]
 
     euroeval_cmd = " ".join(cmd_parts)
 
@@ -185,16 +166,23 @@ export FULL_LOG=1
             raise RuntimeError(f"sbatch failed: {result.stderr}")
 
         # Parse job ID from sbatch output (e.g. "Submitted batch job 12345")
+        job_id: str | None = None
         for line in result.stdout.strip().split("\n"):
             parts = line.split()
             if "job" in parts:
                 job_idx = parts.index("job")
                 if job_idx + 1 < len(parts):
-                    return parts[job_idx + 1]
+                    job_id = parts[job_idx + 1]
+                    break
 
-        raise RuntimeError(
-            f"Could not parse job ID from sbatch output: {result.stdout}"
-        )
+        if job_id is None:
+            raise RuntimeError(
+                f"Could not parse job ID from sbatch output: {result.stdout}"
+            )
+
+        # Return the actual path with the real job ID
+        actual_job_results_path = results_path.parent / f".euroeval_job_{job_id}.jsonl"
+        return job_id, actual_job_results_path
     finally:
         # Clean up the temporary script
         os.unlink(script_path)

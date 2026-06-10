@@ -826,6 +826,7 @@ def _run_claimed_issue(
                 languages=pending,
                 cache_dir=RESULTS_CACHE_DIR.parent,
                 evaluate_test_split=is_core,
+                zero_shot=False,
                 gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
             )
 
@@ -834,31 +835,36 @@ def _run_claimed_issue(
                 failure_output_tail = output[-6000:].strip() or "(no output captured)"
                 failed = pending
             else:
-                # Step 2: Record which lines existed before Slurm job.
-                before = set(read_jsonl_lines(path=RESULTS_PATH))
-
-                # Step 3: Submit Slurm job to airgapped compute node.
-                job_id = submit_slurm_eval_job(
+                # Step 2: Submit Slurm job to airgapped compute node.
+                job_id, job_results_path = submit_slurm_eval_job(
                     model_id=model_id,
                     languages=pending,
                     cache_dir=RESULTS_CACHE_DIR.parent,
                     results_path=RESULTS_PATH,
                     gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
                 )
-                logger.info(f"#{number}: submitted Slurm job {job_id} for {model_id!r}")
+                logger.info(
+                    f"#{number}: submitted Slurm job {job_id} for {model_id!r}, "
+                    f"results -> {job_results_path}"
+                )
 
-                # Step 4: Wait for job completion.
+                # Step 3: Wait for job completion.
                 slurm_exit_code = wait_for_slurm_job(job_id=job_id)
                 logger.info(
                     f"#{number}: Slurm job {job_id} completed with exit code "
                     f"{slurm_exit_code}"
                 )
 
-                # Step 5: Collect results.
+                # Step 4: Collect results from job-specific file.
                 if slurm_exit_code == 0:
                     new_lines = collect_slurm_results(
-                        results_path=RESULTS_PATH, before_lines=before
+                        results_path=job_results_path, before_lines=set()
                     )
+                    # Merge into main results file
+                    if new_lines:
+                        with open(RESULTS_PATH, "a", encoding="utf-8") as f:
+                            for line in new_lines:
+                                f.write(line + "\n")
                     accumulated.extend(new_lines)
                     returncode = 0
                     output = ""
