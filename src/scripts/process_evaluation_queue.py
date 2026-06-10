@@ -481,13 +481,16 @@ def process_queue_once() -> None:
     candidates.sort(key=lambda c: (c[0], c[1], c[2], c[3], c[4], c[5]))
     logger.info(f"Found {len(candidates)} processable issue(s).")
 
-    gpu_bytes = gpu_total_memory_bytes()
-    if gpu_bytes is None:
-        logger.info(
-            "Could not determine local memory budget; skipping the fit pre-check."
-        )
-    else:
-        logger.info(f"Local memory budget: {gpu_bytes / (1024**3):.1f} GiB.")
+    # Skip model size check in airgapped mode — login node GPU info is irrelevant.
+    gpu_bytes: float | None = None
+    if not AIRGAPPED_SLURM:
+        gpu_bytes = gpu_total_memory_bytes()
+        if gpu_bytes is None:
+            logger.info(
+                "Could not determine local memory budget; skipping the fit pre-check."
+            )
+        else:
+            logger.info(f"Local memory budget: {gpu_bytes / (1024**3):.1f} GiB.")
 
     for (
         status_priority,
