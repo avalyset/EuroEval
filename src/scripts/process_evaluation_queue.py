@@ -822,7 +822,11 @@ def _run_claimed_issue(
 
             # Step 1: Pre-download models/datasets to shared cache.
             returncode, output = download_for_airgapped_eval(
-                model_id=model_id, languages=pending, cache_dir=RESULTS_CACHE_DIR.parent
+                model_id=model_id,
+                languages=pending,
+                cache_dir=RESULTS_CACHE_DIR.parent,
+                evaluate_test_split=is_core,
+                gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
             )
 
             if returncode != 0:

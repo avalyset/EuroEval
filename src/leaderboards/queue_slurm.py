@@ -7,6 +7,7 @@ collecting results from the shared filesystem.
 
 from __future__ import annotations
 
+import collections.abc as c
 import json
 import logging
 import os
@@ -19,7 +20,13 @@ logger = logging.getLogger(__name__)
 
 
 def download_for_airgapped_eval(
-    model_id: str, languages: list[str], cache_dir: Path
+    model_id: str,
+    languages: c.Sequence[str],
+    cache_dir: Path,
+    datasets: c.Sequence[str] | None = None,
+    evaluate_test_split: bool = True,
+    zero_shot: bool = False,
+    gpu_memory_utilization: float | None = None,
 ) -> tuple[int, str]:
     """Download models and datasets for airgapped evaluation.
 
@@ -34,6 +41,20 @@ def download_for_airgapped_eval(
             ISO codes to pass via repeated ``--language`` flags.
         cache_dir:
             Directory to store downloaded models and datasets.
+        datasets (optional):
+            Dataset ids to pass via repeated ``--dataset`` flags. When
+            None or empty, no ``--dataset`` flag is passed and the CLI
+            uses its language-driven default. Defaults to None.
+        evaluate_test_split (optional):
+            When True pass ``--evaluate-test-split``; when False pass
+            ``--evaluate-val-split``. Defaults to True.
+        zero_shot (optional):
+            When True pass ``--zero-shot``; otherwise omit (CLI default
+            is few-shot). Defaults to False.
+        gpu_memory_utilization (optional):
+            When set, pass ``--gpu-memory-utilization VALUE``. When None,
+            omit the flag so the euroeval CLI's default applies. Defaults
+            to None.
 
     Returns:
         A ``(returncode, output)`` tuple. A returncode of 127 signals
@@ -48,8 +69,17 @@ def download_for_airgapped_eval(
         str(cache_dir),
         "--trust-remote-code",
     ]
+    cmd.append(
+        "--evaluate-test-split" if evaluate_test_split else "--evaluate-val-split"
+    )
+    if zero_shot:
+        cmd.append("--zero-shot")
     for lang in languages:
         cmd += ["--language", lang]
+    for dataset in datasets or []:
+        cmd += ["--dataset", dataset]
+    if gpu_memory_utilization is not None:
+        cmd += ["--gpu-memory-utilization", str(gpu_memory_utilization)]
 
     logger.info(f"Downloading for airgapped eval: {' '.join(cmd)}")
 
