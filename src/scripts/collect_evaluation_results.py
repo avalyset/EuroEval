@@ -23,6 +23,7 @@ HUGGINGFACE_API_KEY A Hugging Face token with write access to upload results.
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import logging
@@ -61,9 +62,156 @@ logger = logging.getLogger("collect_evaluation_results")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 NEW_RESULTS_PATH = REPO_ROOT / "new_results.jsonl"
 RESULTS_CACHE_DIR = REPO_ROOT / ".euroeval_cache/results"
+SLURM_JOBS_PATH = REPO_ROOT / ".slurm_jobs.jsonl"
 
 # Canonical HF bucket for storing raw results (public read access).
 HF_RAW_BUCKET = "hf://buckets/EuroEval/raw-results"
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments.
+
+    Returns:
+        Parsed arguments namespace.
+    """
+    parser = argparse.ArgumentParser(
+        description="Harvest finished evaluations and regenerate leaderboards."
+    )
+    parser.add_argument(
+        "--collect-slurm",
+        action="store_true",
+        default=False,
+        help=(
+            "Collect results from completed Slurm jobs instead of GitHub issues. "
+            "Reads job metadata from .slurm_jobs.jsonl and merges results from "
+            "job-specific output files."
+        ),
+    )
+    parser.add_argument(
+        "--ssh",
+        metavar="USER@HOST",
+        default=None,
+        help=(
+            "SCP results from a specific VM before collecting. Format: user@host. "
+            "Prompts for TOTP if required."
+        ),
+    )
+    return parser.parse_args()
+
+
+def collect_slurm_results(
+    ssh_target: str | None = None,
+) -> list[tuple[int, list[str], str | None]]:
+    """Collect results from completed Slurm jobs.
+
+    Reads job metadata from ``.slurm_jobs.jsonl``, checks each job for
+    completion via ``sacct``, and merges results from completed jobs.
+
+    Args:
+        ssh_target (optional):
+            If provided, first SCP results from this host before collecting
+            local job results. Format: user@host.
+
+    Returns:
+        A list of ``(issue_number, result_lines, gist_id=None)`` tuples.
+        The gist_id is always None for Slurm collection.
+    """
+    harvested: list[tuple[int, list[str], str | None]] = []
+
+    if ssh_target:
+        logger.info(f"SCP-ing results from {ssh_target}...")
+        # SCP the job results and jobs file
+        result = subprocess.run(  # noqa: S603
+            ["scp", f"{ssh_target}:~/EuroEval/.slurm_jobs.jsonl", str(SLURM_JOBS_PATH)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            logger.warning(f"SCP failed: {result.stderr}")
+        else:
+            logger.info("SCP completed successfully.")
+
+    if not SLURM_JOBS_PATH.exists():
+        logger.info(f"No Slurm jobs file found at {SLURM_JOBS_PATH}.")
+        return harvested
+
+    # Read job records
+    jobs: list[dict] = []
+    with open(SLURM_JOBS_PATH, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                jobs.append(json.loads(line))
+
+    logger.info(f"Found {len(jobs)} recorded Slurm job(s).")
+
+    # Check each job's status and collect results from completed ones
+    completed_jobs: list[dict] = []
+    pending_jobs: list[dict] = []
+
+    for job in jobs:
+        job_id = job["job_id"]
+        result = subprocess.run(  # noqa: S603
+            ["sacct", "-j", job_id, "--format=State,ExitCode", "--noheader"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            logger.warning(f"Could not check job {job_id}: {result.stderr}")
+            pending_jobs.append(job)
+            continue
+
+        # Parse sacct output - first non-empty line has the state
+        state = "PENDING"
+        for sacct_line in result.stdout.strip().split("\n"):
+            parts = sacct_line.split()
+            if parts:
+                state = parts[0]
+                break
+
+        if state in ("COMPLETED", "CANCELLED"):
+            job["status"] = state.lower()
+            completed_jobs.append(job)
+        else:
+            pending_jobs.append(job)
+
+    logger.info(f"Completed: {len(completed_jobs)}, Pending: {len(pending_jobs)}")
+
+    # Collect results from completed jobs
+    for job in completed_jobs:
+        results_path = Path(job["results_path"])
+        if not results_path.exists():
+            logger.warning(
+                f"Job {job['job_id']} completed but results file "
+                f"{results_path} not found."
+            )
+            continue
+
+        lines = []
+        with open(results_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    lines.append(line)
+
+        if lines:
+            logger.info(
+                f"Issue #{job['issue_number']}: collected {len(lines)} "
+                f"result line(s) from job {job['job_id']}."
+            )
+            harvested.append((job["issue_number"], lines, None))
+
+    # Write back pending jobs (remove completed ones)
+    if pending_jobs:
+        with open(SLURM_JOBS_PATH, "w", encoding="utf-8") as f:
+            for job in pending_jobs:
+                f.write(json.dumps(job) + "\n")
+    else:
+        SLURM_JOBS_PATH.unlink(missing_ok=True)
+
+    return harvested
 
 
 def _model_id_to_filename(model_id: str) -> str:
@@ -94,23 +242,29 @@ def main() -> None:
     finished every language (intentional skips included), so the label
     is authoritative.
     """
-    logger.info("Fetching open model evaluation request issues...")
-    try:
-        issues = list_open_request_issues()
-    except urllib.error.HTTPError as e:
-        logger.error(f"Failed to list issues: {e}")
-        sys.exit(1)
-    logger.info(f"Found {len(issues)} open issue(s); scanning for results.")
+    args = parse_args()
 
-    harvested: list[tuple[int, list[str], str | None]] = []
-    for issue in issues:
-        number = issue["number"]
-        lines, gist_id = find_results_for_issue(issue=issue)
-        if not lines:
-            logger.info(f"#{number}: no jsonl block in comments yet -- skipping.")
-            continue
-        logger.info(f"#{number}: found {len(lines)} result line(s).")
-        harvested.append((number, lines, gist_id))
+    if args.collect_slurm:
+        logger.info("Collecting results from Slurm jobs...")
+        harvested = collect_slurm_results(ssh_target=args.ssh)
+    else:
+        logger.info("Fetching open model evaluation request issues...")
+        try:
+            issues = list_open_request_issues()
+        except urllib.error.HTTPError as e:
+            logger.error(f"Failed to list issues: {e}")
+            sys.exit(1)
+        logger.info(f"Found {len(issues)} open issue(s); scanning for results.")
+
+        harvested: list[tuple[int, list[str], str | None]] = []
+        for issue in issues:
+            number = issue["number"]
+            lines, gist_id = find_results_for_issue(issue=issue)
+            if not lines:
+                logger.info(f"#{number}: no jsonl block in comments yet -- skipping.")
+                continue
+            logger.info(f"#{number}: found {len(lines)} result line(s).")
+            harvested.append((number, lines, gist_id))
 
     if not harvested:
         logger.info("Nothing to merge.")

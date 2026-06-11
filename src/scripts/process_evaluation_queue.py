@@ -12,6 +12,18 @@ For each open
    the issue, wrapped in a ``jsonl`` code fence so the local merge script
    can pick them up.
 
+Airgapped Slurm mode
+--------------------
+When ``--airgapped-slurm`` is passed, the script operates in submit-only mode:
+
+1. Pre-downloads models/datasets to a shared cache on the login node.
+2. Submits a Slurm job to the compute node (which runs airgapped).
+3. Records job metadata to ``.slurm_jobs.jsonl`` for later collection.
+4. Posts results to GitHub immediately (assuming success).
+
+Results are collected later via ``collect_evaluation_results.py --collect-slurm``,
+which merges completed job outputs and handles any job failures.
+
 Required env vars
 -----------------
 GITHUB_TOKEN          A PAT with ``issues: write`` for the EuroEval repo.
@@ -35,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import logging
 import os
 import sys
@@ -114,12 +127,7 @@ from leaderboards.queue_runtime import (
     cool_down_between_issues,
     lower_process_priority,
 )
-from leaderboards.queue_slurm import (
-    collect_slurm_results,
-    download_for_airgapped_eval,
-    submit_slurm_eval_job,
-    wait_for_slurm_job,
-)
+from leaderboards.queue_slurm import download_for_airgapped_eval, submit_slurm_eval_job
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
@@ -130,11 +138,50 @@ logger = logging.getLogger("process_evaluation_queue")
 _OLD_RESULT_HASHES: set[str] = set()
 
 
+def _record_slurm_job(
+    job_id: str,
+    issue_number: int,
+    model_id: str,
+    languages: list[str],
+    results_path: Path,
+) -> None:
+    """Record a submitted Slurm job for later result collection.
+
+    Appends a JSON line to ``.slurm_jobs.jsonl`` with the job metadata.
+    The collector script reads this file to know which jobs to check.
+
+    Args:
+        job_id:
+            The Slurm job ID.
+        issue_number:
+            The GitHub issue number this job evaluates.
+        model_id:
+            The model being evaluated.
+        languages:
+            The language codes this job covers.
+        results_path:
+            Path to the job-specific results file.
+    """
+    record = {
+        "job_id": job_id,
+        "issue_number": issue_number,
+        "model_id": model_id,
+        "languages": languages,
+        "results_path": str(results_path),
+        "submitted_at": datetime.now().isoformat(),
+        "status": "submitted",
+    }
+    with open(SLURM_JOBS_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+    logger.info(f"Recorded Slurm job {job_id} for issue #{issue_number}")
+
+
 ASSIGNEE = ""
 VM_ID = os.environ.get("EUROEVAL_VM_ID", "")
 VM_ID_ENV_PATH = Path(os.environ.get("EUROEVAL_DOTENV_PATH", ".env"))
 RESULTS_PATH = Path("euroeval_benchmark_results.jsonl")
 RESULTS_CACHE_DIR = Path(".euroeval_cache/results")
+SLURM_JOBS_PATH = Path(".slurm_jobs.jsonl")
 LOCK_PATH = Path(os.environ.get("EUROEVAL_QUEUE_LOCK", "/tmp/euroeval_queue.lock"))
 
 # Canonical HF buckets for storing results (public read access).
@@ -838,7 +885,7 @@ def _run_claimed_issue(
                 failure_output_tail = output[-6000:].strip() or "(no output captured)"
                 failed = pending
             else:
-                # Step 2: Submit Slurm job to airgapped compute node.
+                # Step 2: Submit Slurm job and record job info for later collection.
                 job_id, job_results_path = submit_slurm_eval_job(
                     model_id=model_id,
                     languages=pending,
@@ -851,36 +898,21 @@ def _run_claimed_issue(
                     f"results -> {job_results_path}"
                 )
 
-                # Step 3: Wait for job completion.
-                slurm_exit_code = wait_for_slurm_job(job_id=job_id)
-                logger.info(
-                    f"#{number}: Slurm job {job_id} completed with exit code "
-                    f"{slurm_exit_code}"
+                # Record job info for the collector script.
+                # The job will write directly to its dedicated file; we just
+                # need to remember which issue/languages it covers.
+                _record_slurm_job(
+                    job_id=job_id,
+                    issue_number=number,
+                    model_id=model_id,
+                    languages=pending,
+                    results_path=job_results_path,
                 )
 
-                # Step 4: Collect results from job-specific file.
-                if slurm_exit_code == 0:
-                    new_lines = collect_slurm_results(
-                        results_path=job_results_path, before_lines=set()
-                    )
-                    # Merge into main results file
-                    if new_lines:
-                        with open(RESULTS_PATH, "a", encoding="utf-8") as f:
-                            for line in new_lines:
-                                f.write(line + "\n")
-                    accumulated.extend(new_lines)
-                    returncode = 0
-                    output = ""
-                else:
-                    failure_reason = (
-                        f"Slurm job {job_id} exited with code {slurm_exit_code}"
-                    )
-                    failure_output_tail = (
-                        "Slurm job failed. Check Slurm logs for details."
-                    )
-                    failed = pending
-                    returncode = slurm_exit_code
-                    output = failure_output_tail
+                # Mark as done - actual result collection happens separately.
+                done.extend(pending)
+                returncode = 0
+                output = ""
         else:
             # Local evaluation mode: run euroeval directly with incremental uploads.
             stop_upload = threading.Event()
