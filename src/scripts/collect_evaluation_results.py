@@ -63,7 +63,7 @@ logger = logging.getLogger("collect_evaluation_results")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 NEW_RESULTS_PATH = REPO_ROOT / "new_results.jsonl"
 RESULTS_CACHE_DIR = REPO_ROOT / ".euroeval_cache/results"
-SLURM_JOBS_PATH = REPO_ROOT / ".slurm_jobs.jsonl"
+SLURM_JOBS_PATH = REPO_ROOT / ".euroeval_cache/.slurm_jobs.jsonl"
 
 # Canonical HF bucket for storing raw results (public read access).
 HF_RAW_BUCKET = "hf://buckets/EuroEval/raw-results"
@@ -84,9 +84,9 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help=(
             "Collect results from completed Slurm jobs. Requires --ssh to SCP "
-            "job metadata and results from the remote VM. GitHub issues are still "
-            "scanned for gist results; Slurm results are added for issues not "
-            "already harvested."
+            "job metadata and results from the shared filesystem (typically the "
+            "login node). GitHub issues are still scanned for gist results; Slurm "
+            "results are added for issues not already harvested."
         ),
     )
     parser.add_argument(
@@ -95,23 +95,25 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "SSH target for collecting Slurm results. Format: user@host. "
-            "Required when using --collect-slurm. SCPs both .slurm_jobs.jsonl "
-            "and job result files from the remote VM. Prompts for TOTP if required."
+            "Required when using --collect-slurm. Should point to a node where "
+            ".euroeval_cache/ is mounted (typically the login node, not compute "
+            "VMs). Prompts for TOTP if required."
         ),
     )
     return parser.parse_args()
 
 
 def collect_slurm_results(ssh_target: str) -> list[tuple[int, list[str], str | None]]:
-    """Collect results from completed Slurm jobs on a remote VM.
+    """Collect results from completed Slurm jobs via a shared filesystem.
 
-    SCPs job metadata and results files from the remote VM, checks each
-    job for completion via ``sacct`` (run locally after SCP), and merges
-    results from completed jobs.
+    SCPs job metadata and results files from a node with shared filesystem
+    access (typically login node), checks each job for completion via ``sacct``
+    (run remotely via SSH to the compute VM), and merges results.
 
     Args:
         ssh_target:
-            SSH target in format user@host. Required.
+            SSH target in format user@host. Should point to a node where
+            ``.euroeval_cache/`` is mounted (login node, not compute VMs).
 
     Returns:
         A list of ``(issue_number, result_lines, gist_id=None)`` tuples.
