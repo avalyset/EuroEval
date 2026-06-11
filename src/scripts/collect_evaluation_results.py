@@ -83,9 +83,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help=(
-            "Collect results from completed Slurm jobs instead of GitHub issues. "
-            "Reads job metadata from .slurm_jobs.jsonl and merges results from "
-            "job-specific output files."
+            "Also collect results from completed Slurm jobs in addition to GitHub "
+            "issues. Reads job metadata from .slurm_jobs.jsonl and merges results "
+            "from job-specific output files. Duplicates are avoided if an issue "
+            "already has results in a GitHub comment."
         ),
     )
     parser.add_argument(
@@ -245,27 +246,42 @@ def main() -> None:
     """
     args = parse_args()
 
+    harvested: list[tuple[int, list[str], str | None]] = []
+
+    # Always collect from GitHub issues with results-ready label
+    logger.info("Fetching open model evaluation request issues...")
+    try:
+        issues = list_open_request_issues()
+    except urllib.error.HTTPError as e:
+        logger.error(f"Failed to list issues: {e}")
+        sys.exit(1)
+    logger.info(f"Found {len(issues)} open issue(s); scanning for results.")
+
+    for issue in issues:
+        number = issue["number"]
+        lines, gist_id = find_results_for_issue(issue=issue)
+        if not lines:
+            logger.info(f"#{number}: no jsonl block in comments yet -- skipping.")
+            continue
+        logger.info(f"#{number}: found {len(lines)} result line(s).")
+        harvested.append((number, lines, gist_id))
+
+    # Additionally collect from Slurm jobs if requested
     if args.collect_slurm:
         logger.info("Collecting results from Slurm jobs...")
-        harvested = collect_slurm_results(ssh_target=args.ssh)
-    else:
-        logger.info("Fetching open model evaluation request issues...")
-        try:
-            issues = list_open_request_issues()
-        except urllib.error.HTTPError as e:
-            logger.error(f"Failed to list issues: {e}")
-            sys.exit(1)
-        logger.info(f"Found {len(issues)} open issue(s); scanning for results.")
-
-        harvested: list[tuple[int, list[str], str | None]] = []
-        for issue in issues:
-            number = issue["number"]
-            lines, gist_id = find_results_for_issue(issue=issue)
-            if not lines:
-                logger.info(f"#{number}: no jsonl block in comments yet -- skipping.")
-                continue
-            logger.info(f"#{number}: found {len(lines)} result line(s).")
-            harvested.append((number, lines, gist_id))
+        slurm_harvested = collect_slurm_results(ssh_target=args.ssh)
+        # Build a set of issue numbers already harvested to avoid duplicates
+        collected_issues = {h[0] for h in harvested}
+        for issue_number, lines, _ in slurm_harvested:
+            if issue_number not in collected_issues:
+                logger.info(
+                    f"#{issue_number}: collected {len(lines)} line(s) from Slurm job."
+                )
+                harvested.append((issue_number, lines, None))
+            else:
+                logger.info(
+                    f"#{issue_number}: already harvested from GitHub; skipping Slurm."
+                )
 
     if not harvested:
         logger.info("Nothing to merge.")
