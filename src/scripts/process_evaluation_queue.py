@@ -199,7 +199,7 @@ VM_ID = os.environ.get("EUROEVAL_VM_ID", "")
 VM_ID_ENV_PATH = Path(os.environ.get("EUROEVAL_DOTENV_PATH", ".env"))
 RESULTS_PATH = Path("euroeval_benchmark_results.jsonl")
 RESULTS_CACHE_DIR = Path(".euroeval_cache/results")
-SLURM_JOBS_PATH = Path(".euroeval_cache/.slurm_jobs.jsonl")
+SLURM_JOBS_PATH = Path(".slurm_jobs.jsonl")  # Same directory as RESULTS_PATH (shared)
 LOCK_PATH = Path(os.environ.get("EUROEVAL_QUEUE_LOCK", "/tmp/euroeval_queue.lock"))
 
 # Canonical HF buckets for storing results (public read access).
@@ -947,8 +947,8 @@ def _run_claimed_issue(
                     languages=pending,
                     results_path=job_results_path,
                 )
-                # Note: .slurm_jobs.jsonl lives in .euroeval_cache/ (shared filesystem)
-                # so it's accessible from both login and compute nodes.
+                # Note: .slurm_jobs.jsonl is in repo root (shared filesystem),
+                # alongside euroeval_benchmark_results.jsonl.
 
                 # Post a comment noting the job was submitted.
                 # Keep the issue assigned so other workers don't pick it up.

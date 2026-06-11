@@ -84,9 +84,9 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help=(
             "Collect results from completed Slurm jobs. Requires --ssh to SCP "
-            "job metadata and results from the shared filesystem (typically the "
-            "login node). GitHub issues are still scanned for gist results; Slurm "
-            "results are added for issues not already harvested."
+            "job metadata and results from the shared filesystem. GitHub issues "
+            "are still scanned for gist results; Slurm results are added for "
+            "issues not already harvested."
         ),
     )
     parser.add_argument(
@@ -96,8 +96,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "SSH target for collecting Slurm results. Format: user@host. "
             "Required when using --collect-slurm. Should point to a node where "
-            ".euroeval_cache/ is mounted (typically the login node, not compute "
-            "VMs). Prompts for TOTP if required."
+            "the repo root (with euroeval_benchmark_results.jsonl) is mounted. "
+            "Prompts for TOTP if required."
         ),
     )
     return parser.parse_args()
