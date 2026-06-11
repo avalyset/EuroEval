@@ -83,10 +83,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help=(
-            "Also collect results from completed Slurm jobs in addition to GitHub "
-            "issues. Reads job metadata from .slurm_jobs.jsonl and merges results "
-            "from job-specific output files. Duplicates are avoided if an issue "
-            "already has results in a GitHub comment."
+            "Collect results from completed Slurm jobs. Requires --ssh to SCP "
+            "job metadata and results from the remote VM. GitHub issues are still "
+            "scanned for gist results; Slurm results are added for issues not "
+            "already harvested."
         ),
     )
     parser.add_argument(
@@ -94,25 +94,24 @@ def parse_args() -> argparse.Namespace:
         metavar="USER@HOST",
         default=None,
         help=(
-            "SCP results from a specific VM before collecting. Format: user@host. "
-            "Prompts for TOTP if required."
+            "SSH target for collecting Slurm results. Format: user@host. "
+            "Required when using --collect-slurm. SCPs both .slurm_jobs.jsonl "
+            "and job result files from the remote VM. Prompts for TOTP if required."
         ),
     )
     return parser.parse_args()
 
 
-def collect_slurm_results(
-    ssh_target: str | None = None,
-) -> list[tuple[int, list[str], str | None]]:
-    """Collect results from completed Slurm jobs.
+def collect_slurm_results(ssh_target: str) -> list[tuple[int, list[str], str | None]]:
+    """Collect results from completed Slurm jobs on a remote VM.
 
-    Reads job metadata from ``.slurm_jobs.jsonl``, checks each job for
-    completion via ``sacct``, and merges results from completed jobs.
+    SCPs job metadata and results files from the remote VM, checks each
+    job for completion via ``sacct`` (run locally after SCP), and merges
+    results from completed jobs.
 
     Args:
-        ssh_target (optional):
-            If provided, first SCP results from this host before collecting
-            local job results. Format: user@host.
+        ssh_target:
+            SSH target in format user@host. Required.
 
     Returns:
         A list of ``(issue_number, result_lines, gist_id=None)`` tuples.
@@ -120,19 +119,18 @@ def collect_slurm_results(
     """
     harvested: list[tuple[int, list[str], str | None]] = []
 
-    if ssh_target:
-        logger.info(f"SCP-ing results from {ssh_target}...")
-        # SCP the job results and jobs file
-        result = subprocess.run(  # noqa: S603
-            ["scp", f"{ssh_target}:~/EuroEval/.slurm_jobs.jsonl", str(SLURM_JOBS_PATH)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            logger.warning(f"SCP failed: {result.stderr}")
-        else:
-            logger.info("SCP completed successfully.")
+    logger.info(f"SCP-ing .slurm_jobs.jsonl from {ssh_target}...")
+    # SCP the jobs file from the remote VM
+    result = subprocess.run(  # noqa: S603
+        ["scp", f"{ssh_target}:~/EuroEval/.slurm_jobs.jsonl", str(SLURM_JOBS_PATH)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        logger.error(f"SCP for jobs file failed: {result.stderr}")
+        return harvested
+    logger.info("SCP for jobs file completed.")
 
     if not SLURM_JOBS_PATH.exists():
         logger.info(f"No Slurm jobs file found at {SLURM_JOBS_PATH}.")
@@ -148,14 +146,23 @@ def collect_slurm_results(
 
     logger.info(f"Found {len(jobs)} recorded Slurm job(s).")
 
-    # Check each job's status and collect results from completed ones
+    # First, check job statuses via SSH (sacct must run on the VM)
     completed_jobs: list[dict] = []
     pending_jobs: list[dict] = []
 
     for job in jobs:
         job_id = job["job_id"]
+        # Run sacct on the remote VM via SSH
         result = subprocess.run(  # noqa: S603
-            ["sacct", "-j", job_id, "--format=State,ExitCode", "--noheader"],
+            [
+                "ssh",
+                ssh_target,
+                "sacct",
+                "-j",
+                job_id,
+                "--format=State,ExitCode",
+                "--noheader",
+            ],
             capture_output=True,
             text=True,
             check=False,
@@ -181,18 +188,29 @@ def collect_slurm_results(
 
     logger.info(f"Completed: {len(completed_jobs)}, Pending: {len(pending_jobs)}")
 
-    # Collect results from completed jobs
+    # SCP results files from completed jobs
     for job in completed_jobs:
-        results_path = Path(job["results_path"])
-        if not results_path.exists():
+        remote_results_path = job["results_path"]
+        # SCP the results file to local .euroeval_cache/results/
+        local_results_path = RESULTS_CACHE_DIR / Path(remote_results_path).name
+        RESULTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+        result = subprocess.run(  # noqa: S603
+            ["scp", f"{ssh_target}:{remote_results_path}", str(local_results_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
             logger.warning(
-                f"Job {job['job_id']} completed but results file "
-                f"{results_path} not found."
+                f"SCP for job {job['job_id']} results failed: {result.stderr}"
             )
+            pending_jobs.append(job)
             continue
 
+        # Read the local copy
         lines = []
-        with open(results_path, encoding="utf-8") as f:
+        with open(local_results_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
@@ -205,13 +223,18 @@ def collect_slurm_results(
             )
             harvested.append((job["issue_number"], lines, None))
 
-    # Write back pending jobs (remove completed ones)
+    # Write back pending jobs locally (remove completed ones)
     if pending_jobs:
         with open(SLURM_JOBS_PATH, "w", encoding="utf-8") as f:
             for job in pending_jobs:
                 f.write(json.dumps(job) + "\n")
+        logger.info(
+            f"Updated local .slurm_jobs.jsonl with {len(pending_jobs)} pending job(s). "
+            f"Remote file left unchanged for manual cleanup."
+        )
     else:
         SLURM_JOBS_PATH.unlink(missing_ok=True)
+        logger.info("All Slurm jobs completed; removed local jobs file.")
 
     return harvested
 
@@ -268,6 +291,9 @@ def main() -> None:
 
     # Additionally collect from Slurm jobs if requested
     if args.collect_slurm:
+        if not args.ssh:
+            logger.error("--collect-slurm requires --ssh USER@HOST")
+            sys.exit(1)
         logger.info("Collecting results from Slurm jobs...")
         slurm_harvested = collect_slurm_results(ssh_target=args.ssh)
         # Build a set of issue numbers already harvested to avoid duplicates
