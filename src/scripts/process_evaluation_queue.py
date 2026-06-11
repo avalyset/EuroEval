@@ -899,8 +899,6 @@ def _run_claimed_issue(
                 )
 
                 # Record job info for the collector script.
-                # The job will write directly to its dedicated file; we just
-                # need to remember which issue/languages it covers.
                 _record_slurm_job(
                     job_id=job_id,
                     issue_number=number,
@@ -909,10 +907,23 @@ def _run_claimed_issue(
                     results_path=job_results_path,
                 )
 
-                # Mark as done - actual result collection happens separately.
-                done.extend(pending)
-                returncode = 0
-                output = ""
+                # Post a comment noting the job was submitted, then release the issue.
+                # The collector script will handle results once the job completes.
+                comment_on_issue(
+                    number=number,
+                    body=(
+                        f"Slurm job `{job_id}` submitted for evaluation. Results "
+                        f"will be collected and posted once the job completes.\n\n"
+                        f"Job output: `{job_results_path}`"
+                    ),
+                )
+                # Release the issue back to the queue - collector will close it later.
+                release_issue_if_owned(number=number, vm_id=VM_ID, assignee=ASSIGNEE)
+                logger.info(
+                    f"#{number}: Slurm job {job_id} submitted; issue released for "
+                    f"collection by collect_evaluation_results.py --collect-slurm"
+                )
+                return  # Skip the rest of the function - no results to post yet.
         else:
             # Local evaluation mode: run euroeval directly with incremental uploads.
             stop_upload = threading.Event()
