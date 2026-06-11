@@ -79,25 +79,14 @@ def parse_args() -> argparse.Namespace:
         description="Harvest finished evaluations and regenerate leaderboards."
     )
     parser.add_argument(
-        "--collect-slurm",
-        action="store_true",
-        default=False,
-        help=(
-            "Collect results from completed Slurm jobs. Requires --ssh to SCP "
-            "job metadata and results from the shared filesystem. GitHub issues "
-            "are still scanned for gist results; Slurm results are added for "
-            "issues not already harvested."
-        ),
-    )
-    parser.add_argument(
         "--ssh",
         metavar="USER@HOST",
         default=None,
         help=(
-            "SSH target for collecting Slurm results. Format: user@host. "
-            "Required when using --collect-slurm. Should point to a node where "
-            "the repo root (with euroeval_benchmark_results.jsonl) is mounted. "
-            "Prompts for TOTP if required."
+            "Collect Slurm results from a remote host via SSH. Format: user@host. "
+            "When provided, the script collects both GitHub gist results and Slurm "
+            "job results from the shared filesystem on that host. When omitted, "
+            "only GitHub gist results are collected."
         ),
     )
     return parser.parse_args()
@@ -291,11 +280,8 @@ def main() -> None:
         logger.info(f"#{number}: found {len(lines)} result line(s).")
         harvested.append((number, lines, gist_id))
 
-    # Additionally collect from Slurm jobs if requested
-    if args.collect_slurm:
-        if not args.ssh:
-            logger.error("--collect-slurm requires --ssh USER@HOST")
-            sys.exit(1)
+    # Collect from Slurm jobs if --ssh is provided
+    if args.ssh:
         logger.info("Collecting results from Slurm jobs...")
         slurm_harvested = collect_slurm_results(ssh_target=args.ssh)
         # Build a set of issue numbers already harvested to avoid duplicates
