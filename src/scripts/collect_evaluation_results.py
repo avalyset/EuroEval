@@ -80,19 +80,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--slurm-ssh",
-        metavar="USER@HOST",
+        metavar="USER@HOST:PATH",
         default=None,
         help=(
-            "Collect Slurm results from a remote host via SSH. Format: user@host. "
-            "When provided, the script collects both GitHub gist results and Slurm "
-            "job results from the shared filesystem on that host. When omitted, "
-            "only GitHub gist results are collected."
+            "Collect Slurm results via SSH in SCP format. Example: "
+            "`user@login:/shared/EuroEval`. When provided, collects both GitHub "
+            "gists and Slurm job results. When omitted, only GitHub gists."
         ),
     )
     return parser.parse_args()
 
 
-def collect_slurm_results(ssh_target: str) -> list[tuple[int, list[str], str | None]]:
+def collect_slurm_results(
+    ssh_target: str, remote_root: str
+) -> list[tuple[int, list[str], str | None]]:
     """Collect results from completed Slurm jobs via a shared filesystem.
 
     SCPs job metadata and results files from a node with shared filesystem
@@ -101,8 +102,10 @@ def collect_slurm_results(ssh_target: str) -> list[tuple[int, list[str], str | N
 
     Args:
         ssh_target:
-            SSH target in format user@host. Should point to a node where
-            ``.euroeval_cache/`` is mounted (login node, not compute VMs).
+            SSH host in format user@host.
+        remote_root:
+            Path to the EuroEval repo root on the remote host
+            (e.g. ``/shared/EuroEval``).
 
     Returns:
         A list of ``(issue_number, result_lines, gist_id=None)`` tuples.
@@ -110,10 +113,10 @@ def collect_slurm_results(ssh_target: str) -> list[tuple[int, list[str], str | N
     """
     harvested: list[tuple[int, list[str], str | None]] = []
 
-    logger.info(f"SCP-ing .slurm_jobs.jsonl from {ssh_target}...")
+    logger.info(f"SCP-ing .slurm_jobs.jsonl from {ssh_target}:{remote_root}...")
     # SCP the jobs file from the remote host
     result = subprocess.run(  # noqa: S603
-        ["scp", f"{ssh_target}:~/EuroEval/.slurm_jobs.jsonl", str(SLURM_JOBS_PATH)],
+        ["scp", f"{ssh_target}:{remote_root}/.slurm_jobs.jsonl", str(SLURM_JOBS_PATH)],
         capture_output=True,
         text=True,
         check=False,
@@ -182,12 +185,14 @@ def collect_slurm_results(ssh_target: str) -> list[tuple[int, list[str], str | N
     # SCP results files from completed jobs
     for job in completed_jobs:
         remote_results_path = job["results_path"]
+        # Build full remote path (remote_results_path is relative to repo root)
+        full_remote_path = f"{remote_root}/{remote_results_path}"
         # SCP the results file to local .euroeval_cache/results/
         local_results_path = RESULTS_CACHE_DIR / Path(remote_results_path).name
         RESULTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
         result = subprocess.run(  # noqa: S603
-            ["scp", f"{ssh_target}:{remote_results_path}", str(local_results_path)],
+            ["scp", f"{ssh_target}:{full_remote_path}", str(local_results_path)],
             capture_output=True,
             text=True,
             check=False,
@@ -283,8 +288,17 @@ def main() -> None:
 
     # Collect from Slurm jobs if --slurm-ssh is provided
     if args.slurm_ssh:
-        logger.info("Collecting results from Slurm jobs...")
-        slurm_harvested = collect_slurm_results(ssh_target=args.slurm_ssh)
+        # Parse USER@HOST:PATH syntax
+        if ":" not in args.slurm_ssh:
+            logger.error(
+                f"--slurm-ssh must be in format USER@HOST:PATH, got: {args.slurm_ssh}"
+            )
+            sys.exit(1)
+        ssh_host, remote_root = args.slurm_ssh.rsplit(":", 1)
+        logger.info(f"Collecting Slurm results from {ssh_host} at {remote_root}...")
+        slurm_harvested = collect_slurm_results(
+            ssh_target=ssh_host, remote_root=remote_root
+        )
         # Build a set of issue numbers already harvested to avoid duplicates
         collected_issues = {h[0] for h in harvested}
         for issue_number, lines, _ in slurm_harvested:
