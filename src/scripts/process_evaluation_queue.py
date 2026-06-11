@@ -138,6 +138,24 @@ logger = logging.getLogger("process_evaluation_queue")
 _OLD_RESULT_HASHES: set[str] = set()
 
 
+def _count_pending_slurm_jobs() -> int:
+    """Count the number of pending Slurm jobs.
+
+    Returns:
+        The number of jobs in ``.slurm_jobs.jsonl`` that are still pending
+        (not yet collected).
+    """
+    if not SLURM_JOBS_PATH.exists():
+        return 0
+    count = 0
+    with open(SLURM_JOBS_PATH, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                count += 1
+    return count
+
+
 def _record_slurm_job(
     job_id: str,
     issue_number: int,
@@ -203,6 +221,7 @@ QUEUE_PASS_SLEEP_SECONDS = 60 * 60
 GPU_MEMORY_UTILIZATION: float | None = None
 THERMAL_CONFIG: ThermalConfig = ThermalConfig()
 AIRGAPPED_SLURM: bool = False
+MAX_CONCURRENT_SLURM_JOBS: int
 
 
 def _model_id_to_filename(model_id: str) -> str:
@@ -291,6 +310,7 @@ def parse_args() -> None:
     global GPU_MEMORY_UTILIZATION
     global THERMAL_CONFIG
     global AIRGAPPED_SLURM
+    global MAX_CONCURRENT_SLURM_JOBS
     parser = argparse.ArgumentParser(
         description="Pick up and evaluate open model-evaluation-request issues."
     )
@@ -331,6 +351,15 @@ def parse_args() -> None:
             "nodes. All GitHub interactions happen on the login node."
         ),
     )
+    parser.add_argument(
+        "--max-concurrent-slurm-jobs",
+        type=int,
+        default=1,
+        help=(
+            "Maximum number of Slurm jobs to have pending at once. When reached, "
+            "the script stops submitting new jobs until some complete. Defaults to 1."
+        ),
+    )
     args = parser.parse_args()
     GPU_MEMORY_UTILIZATION = args.gpu_memory_utilization
     THERMAL_CONFIG = ThermalConfig(
@@ -339,6 +368,7 @@ def parse_args() -> None:
         resume_temp_c=args.thermal_resume_temp,
     )
     AIRGAPPED_SLURM = args.airgapped_slurm
+    MAX_CONCURRENT_SLURM_JOBS = args.max_concurrent_slurm_jobs
 
 
 def ensure_credentials() -> None:
@@ -570,6 +600,17 @@ def process_queue_once() -> None:
                     "issue unassigned so a larger machine can pick it up."
                 )
                 continue
+        # In airgapped mode, check concurrent job limit before claiming new issue
+        if AIRGAPPED_SLURM:
+            pending_count = _count_pending_slurm_jobs()
+            if pending_count >= MAX_CONCURRENT_SLURM_JOBS:
+                logger.info(
+                    f"#{issue['number']}: skipping -- {pending_count} Slurm jobs "
+                    f"pending (limit: {MAX_CONCURRENT_SLURM_JOBS}). Run "
+                    f"collect_evaluation_results.py --collect-slurm to collect results."
+                )
+                # Stop processing - don't claim more issues until jobs complete
+                break
         try:
             process_issue(
                 issue=issue,
