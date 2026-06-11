@@ -79,7 +79,7 @@ def parse_args() -> argparse.Namespace:
         description="Harvest finished evaluations and regenerate leaderboards."
     )
     parser.add_argument(
-        "--ssh",
+        "--slurm-ssh",
         metavar="USER@HOST",
         default=None,
         help=(
@@ -111,7 +111,7 @@ def collect_slurm_results(ssh_target: str) -> list[tuple[int, list[str], str | N
     harvested: list[tuple[int, list[str], str | None]] = []
 
     logger.info(f"SCP-ing .slurm_jobs.jsonl from {ssh_target}...")
-    # SCP the jobs file from the remote VM
+    # SCP the jobs file from the remote host
     result = subprocess.run(  # noqa: S603
         ["scp", f"{ssh_target}:~/EuroEval/.slurm_jobs.jsonl", str(SLURM_JOBS_PATH)],
         capture_output=True,
@@ -143,7 +143,7 @@ def collect_slurm_results(ssh_target: str) -> list[tuple[int, list[str], str | N
 
     for job in jobs:
         job_id = job["job_id"]
-        # Run sacct on the remote VM via SSH
+        # Run sacct on the remote host via SSH
         result = subprocess.run(  # noqa: S603
             [
                 "ssh",
@@ -196,7 +196,8 @@ def collect_slurm_results(ssh_target: str) -> list[tuple[int, list[str], str | N
             logger.warning(
                 f"SCP for job {job['job_id']} results failed: {result.stderr}"
             )
-            pending_jobs.append(job)
+            # Note: Can't append to pending_jobs here since that's for jobs
+            # that failed status checks, not SCP. Just skip this job.
             continue
 
         # Read the local copy
@@ -280,10 +281,10 @@ def main() -> None:
         logger.info(f"#{number}: found {len(lines)} result line(s).")
         harvested.append((number, lines, gist_id))
 
-    # Collect from Slurm jobs if --ssh is provided
-    if args.ssh:
+    # Collect from Slurm jobs if --slurm-ssh is provided
+    if args.slurm_ssh:
         logger.info("Collecting results from Slurm jobs...")
-        slurm_harvested = collect_slurm_results(ssh_target=args.ssh)
+        slurm_harvested = collect_slurm_results(ssh_target=args.slurm_ssh)
         # Build a set of issue numbers already harvested to avoid duplicates
         collected_issues = {h[0] for h in harvested}
         for issue_number, lines, _ in slurm_harvested:
