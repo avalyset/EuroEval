@@ -48,6 +48,7 @@ from leaderboards.github_api import (
     comment_on_issue,
     gh_request,
     list_comments,
+    unassign_issue,
 )
 from leaderboards.hf_mount import create_backup
 from leaderboards.paths import RESULTS_PATH
@@ -323,7 +324,9 @@ def main() -> None:
                 number=number, body="Results now live on the leaderboards 🎉"
             )
             close_issue(number=number)
-            logger.info(f"#{number}: closed.")
+            # Unassign to fully clean up - issue is now closed anyway
+            unassign_issue(number=number, assignee="")
+            logger.info(f"#{number}: closed and unassigned.")
         except urllib.error.HTTPError as e:
             logger.error(f"#{number}: failed to close: {e}")
             continue
