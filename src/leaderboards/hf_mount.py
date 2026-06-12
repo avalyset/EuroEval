@@ -6,7 +6,6 @@ automatic backup creation to pCloud.
 
 import collections.abc as c
 import io
-import logging
 import os
 import subprocess
 import tarfile
@@ -16,31 +15,22 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from .paths import BACKUPS_DIR, BACKUPS_MAX_BYTES
+from .paths import (
+    BACKUPS_DIR,
+    BACKUPS_MAX_BYTES,
+    PROCESSED_RESULTS_DIR,
+    RAW_RESULTS_DIR,
+)
 
 load_dotenv()
 
-HF_RAW_BUCKET = "buckets/EuroEval/raw-results"
+# Raw results bucket mount point - configured to use persistent directory
+HF_RAW_BUCKET = "EuroEval/raw-results"  # Bucket ID for hf-mount (no 'buckets/' prefix)
+MOUNT_POINT = RAW_RESULTS_DIR  # Mount directly to results/raw/
 
-# Mount point configurable via env var, defaults to ~/.local/share/euroeval-results
-# This directory should be:
-# - .gitignore'd (add /euroeval-results or customize path)
-# - On persistent storage (not tmpfs)
-# - Optionally on pCloud/external drive for large datasets
-MOUNT_POINT = Path(
-    os.getenv(
-        "EUROEVAL_MOUNT_POINT", Path.home() / ".local" / "share" / "euroeval-results"
-    )
-).expanduser()
-
-# Verify mount point is not in a git-tracked location
-_cwd_parts = str(Path.cwd().parent)
-if MOUNT_POINT.is_relative_to(Path.cwd()) and "euroeval-results" not in _cwd_parts:
-    logger = logging.getLogger(__name__)
-    logger.warning(
-        f"Mount point {MOUNT_POINT} is inside or near a git repo. "
-        "Ensure it's .gitignore'd to avoid tracking large data files."
-    )
+# Processed results bucket mount point - configured to use persistent directory
+HF_PROCESSED_BUCKET = "EuroEval/processed-results"  # Bucket ID for hf-mount
+PROCESSED_MOUNT_POINT = PROCESSED_RESULTS_DIR  # Mount directly to results/processed/
 
 
 def is_hf_mount_available() -> bool:
@@ -56,51 +46,78 @@ def is_hf_mount_available() -> bool:
         return False
 
 
-def mount_bucket() -> None:
-    """Mount the HF results bucket at the mount point.
+def sync_bucket() -> None:
+    """Sync both HF buckets (raw and processed) using hf sync.
 
-    Uses NFS backend (no root required, works everywhere).
-    Creates mount point directory if needed.
+    Syncs from bucket to local directory using the official hf CLI.
+    Creates local directories if needed.
 
-    Raises:
-        ValueError:
-            If HF_TOKEN environment variable is not set.
+    HF_TOKEN is loaded from .env by load_dotenv() at module import.
     """
     hf_token = os.getenv("HF_TOKEN")
     if not hf_token:
-        raise ValueError(
-            "HF_TOKEN environment variable required for hf-mount. "
-            "Set it in your .env file or export it."
-        )
+        print("⚠ HF_TOKEN not set. Cannot sync from bucket.")
+        return
 
+    # Sync raw results bucket
     MOUNT_POINT.mkdir(parents=True, exist_ok=True)
-
-    # Check if already mounted
-    if MOUNT_POINT.is_mount():
-        print(f"✓ Already mounted at {MOUNT_POINT}")
-        return
-
-    print(f"Mounting HF bucket {HF_RAW_BUCKET} at {MOUNT_POINT}...")
-
-    cmd = [
-        "hf-mount-nfs",
-        "bucket",
-        HF_RAW_BUCKET,
-        str(MOUNT_POINT),
-        "--hf-token",
-        hf_token,
-    ]
-
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-
+    print(f"Syncing raw bucket {HF_RAW_BUCKET} → {MOUNT_POINT}...")
+    result = subprocess.run(
+        ["hf", "sync", f"hf://buckets/{HF_RAW_BUCKET}/", str(MOUNT_POINT)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "HF_TOKEN": hf_token},
+    )
     if result.returncode != 0:
-        # Try fallback to daemon mode
-        print("Daemon mode failed, trying foreground check...")
-        # Just warn and continue - will fall back to tar.gz
-        print(f"⚠ hf-mount failed: {result.stderr}")
+        print(f"⚠ hf sync failed for raw bucket: {result.stderr}")
+    else:
+        print(f"✓ Synced raw bucket: {result.stdout.strip()}")
+
+    # Sync processed results bucket
+    PROCESSED_MOUNT_POINT.mkdir(parents=True, exist_ok=True)
+    print(
+        f"Syncing processed bucket {HF_PROCESSED_BUCKET} → {PROCESSED_MOUNT_POINT}..."
+    )
+    result = subprocess.run(
+        [
+            "hf",
+            "sync",
+            f"hf://buckets/{HF_PROCESSED_BUCKET}/",
+            str(PROCESSED_MOUNT_POINT),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "HF_TOKEN": hf_token},
+    )
+    if result.returncode != 0:
+        print(f"⚠ hf sync failed for processed bucket: {result.stderr}")
+    else:
+        print(f"✓ Synced processed bucket: {result.stdout.strip()}")
+
+
+def mount_bucket() -> None:
+    """Mount the HF bucket if not already mounted."""
+    if MOUNT_POINT.exists() and MOUNT_POINT.is_mount():
         return
 
-    print(f"✓ Mounted at {MOUNT_POINT}")
+    hf_token = os.getenv("HF_TOKEN")
+    if not hf_token:
+        print("⚠ HF_TOKEN not set. Cannot mount bucket.")
+        return
+
+    try:
+        MOUNT_POINT.mkdir(parents=True, exist_ok=True)
+        print(f"Mounting {HF_RAW_BUCKET} → {MOUNT_POINT}...")
+        subprocess.run(
+            ["hf-mount", "start", HF_RAW_BUCKET, str(MOUNT_POINT)],
+            env={**os.environ, "HF_TOKEN": hf_token},
+            check=True,
+        )
+        print("✓ Mounted")
+    except subprocess.CalledProcessError as e:
+        print(f"⚠ Mount failed: {e}")
 
 
 def unmount_bucket() -> None:

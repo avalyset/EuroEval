@@ -51,7 +51,7 @@ from leaderboards.github_api import (
     unassign_issue,
 )
 from leaderboards.hf_mount import create_backup
-from leaderboards.paths import RESULTS_PATH
+from leaderboards.paths import RAW_RESULTS_DIR, RESULTS_PATH
 
 load_dotenv()
 
@@ -581,19 +581,19 @@ def upload_results_to_hf(new_results_path: Path, processed_path: Path) -> bool:
     Returns:
         True if upload succeeded, False otherwise.
     """
-    RESULTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    RAW_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
         # Sync existing results from raw-results bucket
         logger.info(f"Syncing existing results from {HF_RAW_BUCKET}...")
-        HfApi().sync_bucket(source=HF_RAW_BUCKET + "/", dest=str(RESULTS_CACHE_DIR))
+        HfApi().sync_bucket(source=HF_RAW_BUCKET + "/", dest=str(RAW_RESULTS_DIR))
         logger.info("Downloaded existing results from bucket.")
     except HfHubHTTPError as e:
         logger.warning(f"Could not sync from bucket: {e}. Starting fresh.")
 
     # Load existing results by model
     existing_by_model: dict[str, set[str]] = {}
-    for model_file in RESULTS_CACHE_DIR.glob("*.jsonl"):
+    for model_file in RAW_RESULTS_DIR.glob("*.jsonl"):
         lines = {
             line
             for line in model_file.read_text(encoding="utf-8").splitlines()
@@ -612,7 +612,7 @@ def upload_results_to_hf(new_results_path: Path, processed_path: Path) -> bool:
             data = json.loads(line)
             model_id = data.get("model", "unknown")
             filename = _model_id_to_filename(model_id)
-            model_file = RESULTS_CACHE_DIR / filename
+            model_file = RAW_RESULTS_DIR / filename
             # Append if not already present
             if line not in existing_by_model.get(filename, set()):
                 with open(model_file, "a", encoding="utf-8") as f:
@@ -623,7 +623,7 @@ def upload_results_to_hf(new_results_path: Path, processed_path: Path) -> bool:
     # Sync updated results to raw-results bucket
     logger.info(f"Syncing results to {HF_RAW_BUCKET}...")
     try:
-        HfApi().sync_bucket(source=str(RESULTS_CACHE_DIR), dest=HF_RAW_BUCKET + "/")
+        HfApi().sync_bucket(source=str(RAW_RESULTS_DIR), dest=HF_RAW_BUCKET + "/")
         logger.info(f"Uploaded results to {HF_RAW_BUCKET}.")
     except HfHubHTTPError as e:
         logger.error(f"Failed to sync to bucket: {e}")
@@ -684,34 +684,64 @@ def verify_leaderboards() -> bool:
                 reader = csv.DictReader(f)
                 rows = list(reader)
 
-                if len(rows) < 100:
+                if len(rows) < 50:
                     logger.error(
-                        f"{csv_file.name}: Only {len(rows)} rows (expected >100). "
+                        f"{csv_file.name}: Only {len(rows)} rows (expected >=50). "
                         "Possible data loss?"
                     )
                     all_passed = False
                     continue
 
+                if len(rows) < 100:
+                    logger.warning(
+                        f"{csv_file.name}: Only {len(rows)} rows (<100). "
+                        "Expected for simplified/generative-only."
+                    )
+
                 # Check for critical columns
+                # Some CSVs have HTML headers in row 0, actual headers in row 1
+                # Re-read if HTML is present
+                if rows and "rank" not in rows[0]:
+                    # Re-read skipping HTML row
+                    with csv_file.open(mode="r", encoding="utf-8") as f:
+                        next(f)  # Skip HTML row
+                        reader = csv.DictReader(f)  # Use row 1 as headers
+                        rows = list(reader)
+
                 if rows:
-                    required_cols = ["Model", "Mean Score"]
-                    missing = [col for col in required_cols if col not in rows[0]]
-                    if missing:
+                    # Support both snake_case (simplified) and Title Case (full) formats
+                    required_cols_snake = ["model", "mean_rank_score"]
+                    required_cols_title = ["Model", "Rank score"]
+
+                    missing_snake = [
+                        col for col in required_cols_snake if col not in rows[0]
+                    ]
+                    missing_title = [
+                        col for col in required_cols_title if col not in rows[0]
+                    ]
+
+                    # Must have at least one complete set
+                    if missing_snake and missing_title:
                         logger.error(
-                            f"{csv_file.name}: Missing required columns: {missing}"
+                            f"{csv_file.name}: Missing required columns. "
+                            f"Expected {required_cols_snake} or {required_cols_title}, "
+                            f"got {list(rows[0].keys())[:5]}..."
                         )
                         all_passed = False
                         continue
+
+                    # Use whichever format is present
+                    model_col = "model" if not missing_snake else "Model"
 
                     # Check for NaN/None in critical fields
                     nan_count = sum(
                         1
                         for row in rows
-                        if not row.get("Model")
-                        or row.get("Model") in ("NaN", "None", "")
+                        if not row.get(model_col)
+                        or row.get(model_col) in ("NaN", "None", "")
                     )
                     if nan_count > 0:
-                        msg = f"{csv_file.name}: {nan_count} rows with missing Model."
+                        msg = f"{csv_file.name}: {nan_count} rows missing {model_col}."
                         logger.error(msg)
                         all_passed = False
 
